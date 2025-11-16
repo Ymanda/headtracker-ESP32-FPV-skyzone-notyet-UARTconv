@@ -55,3 +55,5 @@ Only `Gimbal-tracking-Gemini.ino` needs to be uploaded to the ESP32. The helper 
 6. Once tuned, disconnect USB power, power the ESP32 from your flight battery/BEC, and strap it to the goggles or the headset strap.
 
 With this setup you get a resilient head-tracker passthrough: the goggles keep sending native PPM to the flight controller while the ESP32 produces a smooth, extended-range servo signal for the AtomRC gimbal.
+
+The convertion to UART signal over ELRS, with addition of 2 ELRS module (one used as tranmitter and the other one as receptor) is yet to come.
