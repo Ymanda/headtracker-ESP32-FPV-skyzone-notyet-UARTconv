@@ -59,20 +59,27 @@ const float LINK_SMOOTH_ALPHA = 0.25f;
 // -----------------------------------------------------------------------------
 enum InputMode {
   MODE_PPM_LOCAL = 0,   // lit PPM sur GPIO2 (test, filaire)
-  MODE_UART_ELRS = 1,   // lit UART1 (depuis module ELRS RX ou ESP32 en filaire)
+  MODE_CRSF_ELRS = 1,   // lit CRSF sur UART1 (depuis module ELRS RX)
   MODE_ESPNOW    = 2    // lit ESP-NOW (depuis TX ESP32)
 };
 
-InputMode inputMode      = MODE_ESPNOW;
+InputMode inputMode       = MODE_ESPNOW;
 const int MODE_SELECT_PIN = -1;
 const bool MODE_SELECT_PULLUP = true;
 
-// UART (ELRS / liaison filaire)
+// UART (CRSF / ELRS)
 HardwareSerial elrsSerial(1);
 const int ELRS_UART_TX_PIN = -1;        // Not used on RX (RX only)
 const int ELRS_UART_RX_PIN = 17;        // UART RX in
-const unsigned long ELRS_UART_BAUD = 115200;
+const unsigned long ELRS_UART_BAUD = 420000;
 bool elrsReady = false;
+
+// CRSF constants
+const uint8_t  CRSF_DEVICE_ADDRESS        = 0xC8;
+const uint8_t  CRSF_FRAMETYPE_RC_CHANNELS = 0x16;
+const uint8_t  CRSF_RC_PAYLOAD_LEN        = 22;
+const uint8_t  CRSF_RC_CHANNEL_COUNT      = 16;
+const uint8_t  CRSF_MAX_FRAME_LEN         = 64;
 
 // ESP-NOW settings
 bool espNowReady = false;
@@ -108,7 +115,11 @@ void initElrsUartRX();
 void setInputMode(InputMode newMode, bool announce);
 const char* modeName(InputMode m);
 void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len);
-void readElrsPackets();
+void readCrsfPackets();
+void applyCrsfChannels(const uint8_t* payload);
+uint8_t crsfCalcCRC(const uint8_t* data, uint8_t len);
+int crsfToMicroseconds(uint16_t value);
+int microsecondsToDegrees(int microseconds, int degMin, int degMax);
 
 // -----------------------------------------------------------------------------
 // SETUP
@@ -132,20 +143,20 @@ void setup() {
 
   Serial.println("Skyzone 04X PRO Head Tracker RX (Drone)");
   Serial.println("=====================================");
-  Serial.println("Modes: PPM local, UART ELRS, ESP-NOW");
+  Serial.println("Modes: PPM local, CRSF/ELRS, ESP-NOW");
 
   // Mode hardware optionnel
   if (MODE_SELECT_PIN >= 0) {
     pinMode(MODE_SELECT_PIN, MODE_SELECT_PULLUP ? INPUT_PULLUP : INPUT);
     bool high = digitalRead(MODE_SELECT_PIN);
-    inputMode = high ? MODE_UART_ELRS : MODE_PPM_LOCAL;
+    inputMode = high ? MODE_CRSF_ELRS : MODE_PPM_LOCAL;
   }
 
   setInputMode(inputMode, false);
 
   Serial.printf("Initial mode: %s\n", modeName(inputMode));
   Serial.println("Commands: 'center', 'debug', 'limits', 'test',");
-  Serial.println("          'deadband X', 'smooth Y', 'mode ppm|uart|espnow'");
+  Serial.println("          'deadband X', 'smooth Y', 'mode ppm|crsf|espnow'");
   delay(500);
 }
 
@@ -165,8 +176,8 @@ void loop() {
     }
     haveSignal = (now - lastValidFrame <= SIGNAL_TIMEOUT);
 
-  } else if (inputMode == MODE_UART_ELRS) {
-    readElrsPackets();  // met à jour targetPan/tilt + lastValidFrame
+  } else if (inputMode == MODE_CRSF_ELRS) {
+    readCrsfPackets();  // met à jour targetPan/tilt + lastValidFrame
     haveSignal = (now - lastValidFrame <= SIGNAL_TIMEOUT);
 
   } else if (inputMode == MODE_ESPNOW) {
@@ -287,27 +298,56 @@ void initElrsUartRX() {
   }
   elrsSerial.begin(ELRS_UART_BAUD, SERIAL_8N1, ELRS_UART_RX_PIN, ELRS_UART_TX_PIN);
   elrsReady = true;
-  Serial.println("ELRS UART RX ready.");
+  Serial.println("ELRS CRSF UART RX ready.");
 }
 
-void readElrsPackets() {
+void readCrsfPackets() {
   if (!elrsReady) initElrsUartRX();
   if (!elrsReady) return;
 
-  while (elrsSerial.available() >= (int)sizeof(ControlPacket)) {
-    ControlPacket pkt;
-    elrsSerial.readBytes((char*)&pkt, sizeof(pkt));
+  static enum { WAIT_ADDR, WAIT_LEN, READ_FRAME } state = WAIT_ADDR;
+  static uint8_t frameLen = 0;
+  static uint8_t frameIdx = 0;
+  static uint8_t frameBuf[CRSF_MAX_FRAME_LEN];
 
-    if (pkt.header != 0xA55A) continue;
-    if (pkt.checksum != packetChecksum(pkt)) continue;
-
-    linkPan  += (pkt.pan  - linkPan)  * LINK_SMOOTH_ALPHA;
-    linkTilt += (pkt.tilt - linkTilt) * LINK_SMOOTH_ALPHA;
-
-    targetPan  = constrain(static_cast<int>(linkPan  + 0.5f), PAN_MIN,  PAN_MAX);
-    targetTilt = constrain(static_cast<int>(linkTilt + 0.5f), TILT_MIN, TILT_MAX);
-
-    lastValidFrame = millis();
+  while (elrsSerial.available()) {
+    uint8_t byteIn = elrsSerial.read();
+    switch (state) {
+      case WAIT_ADDR:
+        if (byteIn == CRSF_DEVICE_ADDRESS) {
+          state = WAIT_LEN;
+        }
+        break;
+      case WAIT_LEN:
+        if (byteIn < 2 || byteIn > CRSF_MAX_FRAME_LEN) {
+          state = WAIT_ADDR;
+          break;
+        }
+        frameLen = byteIn;
+        frameIdx = 0;
+        state = READ_FRAME;
+        break;
+      case READ_FRAME:
+        if (frameIdx < CRSF_MAX_FRAME_LEN) {
+          frameBuf[frameIdx++] = byteIn;
+        }
+        if (frameIdx >= frameLen) {
+          // frameBuf contains [type][payload...][crc]
+          uint8_t type = frameBuf[0];
+          if (frameLen >= 2) {
+            uint8_t crc = frameBuf[frameLen - 1];
+            uint8_t calc = crsfCalcCRC(frameBuf, frameLen - 1);
+            if (calc == crc) {
+              uint8_t payloadLen = frameLen - 2;
+              if (type == CRSF_FRAMETYPE_RC_CHANNELS && payloadLen == CRSF_RC_PAYLOAD_LEN) {
+                applyCrsfChannels(&frameBuf[1]);
+              }
+            }
+          }
+          state = WAIT_ADDR;
+        }
+        break;
+    }
   }
 }
 
@@ -348,12 +388,12 @@ void processSerialCommand(String command) {
   } else if (command.startsWith("mode")) {
     if (command.endsWith("pwm") || command.endsWith("ppm")) {
       setInputMode(MODE_PPM_LOCAL, true);
-    } else if (command.endsWith("uart")) {
-      setInputMode(MODE_UART_ELRS, true);
+    } else if (command.endsWith("crsf") || command.endsWith("elrs") || command.endsWith("uart")) {
+      setInputMode(MODE_CRSF_ELRS, true);
     } else if (command.endsWith("espnow")) {
       setInputMode(MODE_ESPNOW, true);
     } else {
-      Serial.println("Unknown mode. Use 'mode ppm', 'mode uart', or 'mode espnow'.");
+      Serial.println("Unknown mode. Use 'mode ppm', 'mode crsf', or 'mode espnow'.");
     }
 
   } else if (command == "debug") {
@@ -399,7 +439,7 @@ void processSerialCommand(String command) {
 
   } else {
     Serial.println("Unknown command. Available: center, debug, limits, test,");
-    Serial.println("deadband X, smooth Y, mode ppm|uart|espnow");
+    Serial.println("deadband X, smooth Y, mode ppm|crsf|espnow");
   }
 }
 
@@ -451,7 +491,7 @@ void setInputMode(InputMode newMode, bool announce) {
     case MODE_ESPNOW:
       initEspNowRX();
       break;
-    case MODE_UART_ELRS:
+    case MODE_CRSF_ELRS:
       initElrsUartRX();
       break;
     case MODE_PPM_LOCAL:
@@ -467,8 +507,63 @@ void setInputMode(InputMode newMode, bool announce) {
 const char* modeName(InputMode m) {
   switch (m) {
     case MODE_PPM_LOCAL: return "PPM local";
-    case MODE_UART_ELRS: return "UART ELRS";
+    case MODE_CRSF_ELRS: return "CRSF / ELRS";
     case MODE_ESPNOW:    return "ESP-NOW";
     default:             return "Unknown";
   }
+}
+
+void applyCrsfChannels(const uint8_t* payload) {
+  uint32_t bitBuffer = 0;
+  uint8_t bitsInBuffer = 0;
+  uint16_t channels[CRSF_RC_CHANNEL_COUNT] = {0};
+  uint8_t byteIndex = 0;
+
+  for (int ch = 0; ch < CRSF_RC_CHANNEL_COUNT; ++ch) {
+    while (bitsInBuffer < 11 && byteIndex < CRSF_RC_PAYLOAD_LEN) {
+      bitBuffer |= ((uint32_t)payload[byteIndex++]) << bitsInBuffer;
+      bitsInBuffer += 8;
+    }
+    channels[ch] = bitBuffer & 0x7FF;
+    bitBuffer >>= 11;
+    bitsInBuffer -= 11;
+  }
+
+  int panMicro  = crsfToMicroseconds(channels[0]);
+  int tiltMicro = crsfToMicroseconds(channels[1]);
+  int panDeg    = microsecondsToDegrees(panMicro, PAN_MIN, PAN_MAX);
+  int tiltDeg   = microsecondsToDegrees(tiltMicro, TILT_MIN, TILT_MAX);
+
+  linkPan  += (panDeg  - linkPan)  * LINK_SMOOTH_ALPHA;
+  linkTilt += (tiltDeg - linkTilt) * LINK_SMOOTH_ALPHA;
+
+  targetPan  = constrain(static_cast<int>(linkPan  + 0.5f), PAN_MIN,  PAN_MAX);
+  targetTilt = constrain(static_cast<int>(linkTilt + 0.5f), TILT_MIN, TILT_MAX);
+
+  lastValidFrame = millis();
+}
+
+uint8_t crsfCalcCRC(const uint8_t* data, uint8_t len) {
+  const uint8_t POLY = 0xD5;
+  uint8_t crc = 0;
+  while (len--) {
+    crc ^= *data++;
+    for (uint8_t i = 0; i < 8; ++i) {
+      if (crc & 0x80) crc = (crc << 1) ^ POLY;
+      else crc <<= 1;
+    }
+  }
+  return crc;
+}
+
+int crsfToMicroseconds(uint16_t value) {
+  value = constrain(value, 172, 1811);
+  long micro = map(value, 172, 1811, 988, 2012);
+  return (int)constrain(micro, 1000L, 2000L);
+}
+
+int microsecondsToDegrees(int microseconds, int degMin, int degMax) {
+  microseconds = constrain(microseconds, 1000, 2000);
+  long deg = map(microseconds, 1000, 2000, degMin, degMax);
+  return (int)constrain(deg, degMin, degMax);
 }
