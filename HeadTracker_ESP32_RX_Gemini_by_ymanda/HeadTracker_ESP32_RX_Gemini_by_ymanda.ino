@@ -1,46 +1,33 @@
+// RX_Headtracker.ino
 #include <ESP32Servo.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <HardwareSerial.h>
 
 // ============================================================================
-// AtomRC gimbal RX bridge (drone side)
-// ----------------------------------------------------------------------------
-// Diagram reference (mirrors HTML diagram titles):
-//   A. Servo + failsafe core
-//   B. Input modes (PPM / CRSF / ESP-NOW)
-//   C. Transport receivers (ISR, CRSF parser, ESP-NOW callback)
-//   D. CLI + tuning helpers
-// Use editor folding on the section separators to hide implementation details.
+// AtomRC gimbal RX bridge (drone side) - AUTO SOURCE SELECTION
+//  - CRSF/ELRS has priority
+//  - ESP-NOW used as fallback if CRSF is lost
+//  - Optional local PPM mode
 // ============================================================================
 
-// -----------------------------------------------------------------------------
-// USER CONFIGURATION — RX (DRONE SIDE)
-// -----------------------------------------------------------------------------
-const char* ELRS_BIND_PHRASE = "gimbal";  // pour mémoire
-// MAC de l'ESP32 TX (WiFi.macAddress() sur le TX -> 3C:8A:1F:A6:5A:80)
-const uint8_t ESP_NOW_PEER_MAC[6] = {0x3C, 0x8A, 0x1F, 0xA6, 0x5A, 0x80};
-
 // ---------------------------------------------------------------------------
-// SECTION A — Servo core & smoothing knobs
+// SECTION A — Servo core & smoothing
 // ---------------------------------------------------------------------------
-// Servo setup
 Servo panServo;
 Servo tiltServo;
 
-// Pin definitions
 const int PPM_INPUT_PIN = 2;    // PPM signal (mode PPM local)
 const int PAN_PIN       = 18;   // Pan servo output
 const int TILT_PIN      = 19;   // Tilt servo output
 
-// PPM processing variables (pour mode PPM local)
-volatile unsigned long ppmPulseStart = 0;
-volatile unsigned long ppmChannels[8] = {1500,1500,1500,1500,1500,1500,1500,1500};
-volatile int   ppmChannelIndex  = 0;
-volatile bool  ppmFrameComplete = false;
+volatile unsigned long ppmChannels[8] = {
+  1500,1500,1500,1500,1500,1500,1500,1500
+};
+volatile int   ppmChannelIndex   = 0;
+volatile bool  ppmFrameComplete  = false;
 volatile unsigned long lastValidFrame = 0;
 
-// Servo limits and positions
 const int PAN_CENTER = 90;
 const int PAN_MIN    = 0;
 const int PAN_MAX    = 180;
@@ -49,42 +36,36 @@ const int TILT_CENTER = 90;
 const int TILT_MIN    = 45;
 const int TILT_MAX    = 135;
 
-// Current positions
 int currentPan  = PAN_CENTER;
 int currentTilt = TILT_CENTER;
 int targetPan   = PAN_CENTER;
 int targetTilt  = TILT_CENTER;
 
-// Timing / failsafe
 const unsigned long PPM_PULSE_MIN  = 900;
 const unsigned long PPM_PULSE_MAX  = 2100;
 const unsigned long PPM_FRAME_GAP  = 4000;
-const unsigned long SIGNAL_TIMEOUT = 500;   // ms – timeout radio ou PPM
+const unsigned long SIGNAL_TIMEOUT = 500;   // PPM failsafe timeout
 
-// Smoothing and deadband
 int   deadband     = 3;
 int   smoothFactor = 5;
 
-// Link smoothing (si tu veux lisser un peu les paquets reçus)
 const float LINK_SMOOTH_ALPHA = 0.25f;
+const unsigned long LOG_INTERVAL_MS = 2000;
 
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // SECTION B — Input mode selection
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 enum InputMode {
-  MODE_PPM_LOCAL = 0,   // lit PPM sur GPIO2 (test, filaire)
-  MODE_CRSF_ELRS = 1,   // lit CRSF sur UART1 (depuis module ELRS RX)
-  MODE_ESPNOW    = 2    // lit ESP-NOW (depuis TX ESP32)
+  MODE_PPM_LOCAL = 0,
+  MODE_RF_AUTO   = 1
 };
 
-InputMode inputMode       = MODE_CRSF_ELRS;
-const int MODE_SELECT_PIN = -1;
-const bool MODE_SELECT_PULLUP = true;
+InputMode inputMode = MODE_RF_AUTO;
 
-// UART (CRSF / ELRS)
+// ---------------- ELRS / CRSF UART (RX only) ----------------
 HardwareSerial elrsSerial(1);
-const int ELRS_UART_TX_PIN = -1;        // Not used on RX (RX only)
-const int ELRS_UART_RX_PIN = 17;        // UART RX in
+const int ELRS_UART_TX_PIN = -1;   // not used on RX
+const int ELRS_UART_RX_PIN = 16;   // RX from ELRS module -> ESP32
 const unsigned long ELRS_UART_BAUD = 420000;
 bool elrsReady = false;
 
@@ -95,29 +76,38 @@ const uint8_t  CRSF_RC_PAYLOAD_LEN        = 22;
 const uint8_t  CRSF_RC_CHANNEL_COUNT      = 16;
 const uint8_t  CRSF_MAX_FRAME_LEN         = 64;
 
-// ESP-NOW settings
+// ---------------- ESP-NOW (RX only) ----------------
 bool espNowReady = false;
 
-// -----------------------------------------------------------------------------
-// Packet commun TX/RX (ESP-NOW only; CRSF uses native frames)
-// -----------------------------------------------------------------------------
+// Packet commun (ESP-NOW)
 struct __attribute__((packed)) ControlPacket {
-  uint16_t header;   // 0xA55A
-  uint16_t pan;      // degrees
-  uint16_t tilt;     // degrees
-  uint16_t flags;    // bit0: valid frame
-  uint16_t checksum; // XOR
+  uint16_t header;
+  uint16_t pan;
+  uint16_t tilt;
+  uint16_t flags;
+  uint16_t checksum;
 };
 
 uint16_t packetChecksum(const ControlPacket& pkt) {
   return pkt.header ^ pkt.pan ^ pkt.tilt ^ pkt.flags ^ 0x55AA;
 }
 
-// pour smoothing des paquets
 float linkPan  = PAN_CENTER;
 float linkTilt = TILT_CENTER;
 
-// --- FORWARD DECLARATIONS ---
+// ---- ACTIVE SOURCE SELECTION ----
+enum ActiveSource {
+  SOURCE_NONE = 0,
+  SOURCE_ESPNOW,
+  SOURCE_CRSF
+};
+
+ActiveSource   activeSource      = SOURCE_NONE;
+unsigned long  lastEspNowTime    = 0;
+unsigned long  lastCrsfTime      = 0;
+const unsigned long SOURCE_TIMEOUT_MS = 400;
+
+// --- Forward declarations
 void IRAM_ATTR ppmInterrupt();
 void processPPMFrame();
 void updateServos();
@@ -128,6 +118,7 @@ void initEspNowRX();
 void initElrsUartRX();
 void setInputMode(InputMode newMode, bool announce);
 const char* modeName(InputMode m);
+const char* sourceName(ActiveSource s);
 void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len);
 void readCrsfPackets();
 void applyCrsfChannels(const uint8_t* payload);
@@ -140,8 +131,8 @@ int microsecondsToDegrees(int microseconds, int degMin, int degMax);
 // -----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  delay(200);
 
-  // 1) Attach servos immediately so failsafe centers are respected.
   panServo.attach(PAN_PIN);
   tiltServo.attach(TILT_PIN);
   currentPan  = constrain(PAN_CENTER,  PAN_MIN,  PAN_MAX);
@@ -151,103 +142,120 @@ void setup() {
   panServo.write(currentPan);
   tiltServo.write(currentTilt);
 
-  // 2) Arm the optional PPM test input (useful when ESP32 is wired straight to goggles).
   pinMode(PPM_INPUT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PPM_INPUT_PIN), ppmInterrupt, CHANGE);
 
-  Serial.println("Skyzone 04X PRO Head Tracker RX (Drone)");
-  Serial.println("=====================================");
-  Serial.println("Modes: PPM local, CRSF/ELRS, ESP-NOW");
-
-  // 3) Optional hardware selector (jumper/switch) chooses between wired PPM and CRSF.
-  if (MODE_SELECT_PIN >= 0) {
-    pinMode(MODE_SELECT_PIN, MODE_SELECT_PULLUP ? INPUT_PULLUP : INPUT);
-    bool high = digitalRead(MODE_SELECT_PIN);
-    inputMode = high ? MODE_CRSF_ELRS : MODE_PPM_LOCAL;
-  }
+  Serial.println("RX: Auto source selection (CRSF priority, ESP-NOW fallback)");
 
   setInputMode(inputMode, false);
 
   Serial.printf("Initial mode: %s\n", modeName(inputMode));
-  Serial.println("Commands: 'center', 'debug', 'limits', 'test',");
-  Serial.println("          'deadband X', 'smooth Y', 'mode ppm|crsf|espnow'");
-  delay(500);
+  Serial.println("Commands: 'center', 'debug', 'test', 'mode pwm|auto'");
+  delay(200);
 }
 
 // -----------------------------------------------------------------------------
-// SECTION C — Main loop + failsafe handling
+// LOOP
 // -----------------------------------------------------------------------------
 void loop() {
   bool haveSignal = false;
   unsigned long now = millis();
+  static unsigned long lastHeartbeat = 0;
 
-  // 1) Poll whichever transport is active and update lastValidFrame.
   if (inputMode == MODE_PPM_LOCAL) {
+    // PPM local seulement
     if (ppmFrameComplete) {
       processPPMFrame();
       ppmFrameComplete = false;
       lastValidFrame = now;
     }
     haveSignal = (now - lastValidFrame <= SIGNAL_TIMEOUT);
+    if (!haveSignal) {
+      targetPan  = PAN_CENTER;
+      targetTilt = TILT_CENTER;
+      activeSource = SOURCE_NONE;
+    }
+  } else {
+    // RF auto : CRSF priorité, sinon ESP-NOW
+    readCrsfPackets(); // met à jour lastCrsfTime si frames valides
 
-  } else if (inputMode == MODE_CRSF_ELRS) {
-    readCrsfPackets();  // met à jour targetPan/tilt + lastValidFrame
-    haveSignal = (now - lastValidFrame <= SIGNAL_TIMEOUT);
+    bool crsfAlive = (now - lastCrsfTime   <= SOURCE_TIMEOUT_MS);
+    bool espAlive  = (now - lastEspNowTime <= SOURCE_TIMEOUT_MS);
 
-  } else if (inputMode == MODE_ESPNOW) {
-    // les paquets ESP-NOW sont traités dans le callback
-    haveSignal = (now - lastValidFrame <= SIGNAL_TIMEOUT);
+    if (crsfAlive) {
+      activeSource = SOURCE_CRSF;
+    } else if (espAlive) {
+      if (activeSource != SOURCE_CRSF) activeSource = SOURCE_ESPNOW;
+    } else {
+      activeSource = SOURCE_NONE;
+    }
+
+    haveSignal = (activeSource != SOURCE_NONE);
+    if (!haveSignal) {
+      targetPan  = PAN_CENTER;
+      targetTilt = TILT_CENTER;
+    }
+    if (haveSignal) lastValidFrame = now;
   }
 
-  // 2) Failsafe : recentrer si plus de signal
-  if (!haveSignal) {
-    targetPan  = PAN_CENTER;
-    targetTilt = TILT_CENTER;
-  }
-
-  // 3) Slew servos toward target (keeps motion smooth even if packets jump).
   updateServos();
 
-  // 4) Serial CLI for runtime tuning / diagnostics.
   if (Serial.available()) {
     String cmd = Serial.readString();
     cmd.trim();
     processSerialCommand(cmd);
   }
 
-  delay(20);  // ~50 Hz
+  if (now - lastHeartbeat >= LOG_INTERVAL_MS) {
+    lastHeartbeat = now;
+    Serial.printf("[HB] mode=%s src=%s signal=%s pan=%d tilt=%d\n",
+                  modeName(inputMode),
+                  sourceName(activeSource),
+                  haveSignal ? "ok" : "failsafe",
+                  targetPan,
+                  targetTilt);
+  }
+
+  delay(20);
 }
 
 // -----------------------------------------------------------------------------
-// SECTION D — Transport receivers
+// PPM ISR & decode
 // -----------------------------------------------------------------------------
-// --- PPM ISR (local wired fallback) ---
 void IRAM_ATTR ppmInterrupt() {
   static unsigned long lastPulseTime = 0;
   unsigned long currentTime = micros();
+
   bool pinState = digitalRead(PPM_INPUT_PIN);
 
   if (pinState == HIGH) {
-    lastPulseTime = currentTime;
+    lastPulseTime = currentTime;   // début de pulse
   } else {
     unsigned long pulseDuration = currentTime - lastPulseTime;
+
     if (pulseDuration > PPM_FRAME_GAP) {
-      ppmChannelIndex  = 0;
-      ppmFrameComplete = true;
-    } else if (pulseDuration >= PPM_PULSE_MIN && pulseDuration <= PPM_PULSE_MAX) {
+      ppmChannelIndex = 0;
+    } else if (pulseDuration >= PPM_PULSE_MIN &&
+               pulseDuration <= PPM_PULSE_MAX) {
       if (ppmChannelIndex < 8) {
         ppmChannels[ppmChannelIndex] = pulseDuration;
         ppmChannelIndex++;
+        if (ppmChannelIndex >= 6) {
+          ppmFrameComplete = true;
+        }
       }
     }
   }
 }
 
+
+
 void processPPMFrame() {
+  // CH5/CH6 -> pan/tilt (comme tu avais)
   unsigned long panPulse  = ppmChannels[4];  // CH5
   unsigned long tiltPulse = ppmChannels[5];  // CH6
 
-  if (panPulse < PPM_PULSE_MIN || panPulse > PPM_PULSE_MAX)   panPulse = 1500;
+  if (panPulse < PPM_PULSE_MIN  || panPulse > PPM_PULSE_MAX)  panPulse  = 1500;
   if (tiltPulse < PPM_PULSE_MIN || tiltPulse > PPM_PULSE_MAX) tiltPulse = 1500;
 
   int newPan  = map(panPulse,  1000, 2000, PAN_MIN,  PAN_MAX);
@@ -267,10 +275,10 @@ void processPPMFrame() {
 }
 
 // -----------------------------------------------------------------------------
-// ESP-NOW RX
+// ESP-NOW receive (RX only)
 // -----------------------------------------------------------------------------
-void onEspNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
-  (void)info; // Source MAC lives inside info->src_addr if needed later.
+void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
+  (void)mac;
   if (len != sizeof(ControlPacket)) return;
 
   ControlPacket pkt;
@@ -278,15 +286,22 @@ void onEspNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
 
   if (pkt.header != 0xA55A) return;
   if (pkt.checksum != packetChecksum(pkt)) return;
+  if ((pkt.flags & 0x0001u) == 0) return; // bit 0 = valid PPM
 
-  // lissage léger du lien
   linkPan  += (pkt.pan  - linkPan)  * LINK_SMOOTH_ALPHA;
   linkTilt += (pkt.tilt - linkTilt) * LINK_SMOOTH_ALPHA;
 
   targetPan  = constrain(static_cast<int>(linkPan  + 0.5f), PAN_MIN,  PAN_MAX);
   targetTilt = constrain(static_cast<int>(linkTilt + 0.5f), TILT_MIN, TILT_MAX);
 
-  lastValidFrame = millis();
+  lastEspNowTime = millis();
+  lastValidFrame = lastEspNowTime;
+
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    Serial.printf("[ESP-NOW] First packet pan=%u tilt=%u\n", pkt.pan, pkt.tilt);
+  }
 }
 
 void initEspNowRX() {
@@ -296,15 +311,19 @@ void initEspNowRX() {
     Serial.println("ESP-NOW init failed!");
     return;
   }
+#if ESP_IDF_VERSION_MAJOR >= 4
+  esp_now_register_recv_cb([](const esp_now_recv_info* info, const uint8_t* data, int len){
+    onEspNowRecv(info->src_addr, data, len);
+  });
+#else
   esp_now_register_recv_cb(onEspNowRecv);
-
-  // pas obligé d'ajouter un peer pour RX seulement, mais on peut si tu veux du bidirectionnel
+#endif
   espNowReady = true;
   Serial.println("ESP-NOW RX ready.");
 }
 
 // -----------------------------------------------------------------------------
-// UART RX (ELRS ou filaire)
+// UART (CRSF) receive (RX only)
 // -----------------------------------------------------------------------------
 void initElrsUartRX() {
   if (elrsReady) return;
@@ -314,10 +333,9 @@ void initElrsUartRX() {
   }
   elrsSerial.begin(ELRS_UART_BAUD, SERIAL_8N1, ELRS_UART_RX_PIN, ELRS_UART_TX_PIN);
   elrsReady = true;
-  Serial.println("ELRS CRSF UART RX ready.");
+  Serial.println("ELRS CRSF UART RX ready on GPIO 16.");
 }
 
-// Stateful parser for CRSF RC_CHANNELS_PACKED frames arriving over UART1.
 void readCrsfPackets() {
   if (!elrsReady) initElrsUartRX();
   if (!elrsReady) return;
@@ -331,9 +349,7 @@ void readCrsfPackets() {
     uint8_t byteIn = elrsSerial.read();
     switch (state) {
       case WAIT_ADDR:
-        if (byteIn == CRSF_DEVICE_ADDRESS) {
-          state = WAIT_LEN;
-        }
+        if (byteIn == CRSF_DEVICE_ADDRESS) state = WAIT_LEN;
         break;
       case WAIT_LEN:
         if (byteIn < 2 || byteIn > CRSF_MAX_FRAME_LEN) {
@@ -342,21 +358,21 @@ void readCrsfPackets() {
         }
         frameLen = byteIn;
         frameIdx = 0;
-        state = READ_FRAME;
+        state    = READ_FRAME;
         break;
       case READ_FRAME:
         if (frameIdx < CRSF_MAX_FRAME_LEN) {
           frameBuf[frameIdx++] = byteIn;
         }
         if (frameIdx >= frameLen) {
-          // frameBuf contains [type][payload...][crc]
           uint8_t type = frameBuf[0];
           if (frameLen >= 2) {
-            uint8_t crc = frameBuf[frameLen - 1];
+            uint8_t crc  = frameBuf[frameLen - 1];
             uint8_t calc = crsfCalcCRC(frameBuf, frameLen - 1);
             if (calc == crc) {
               uint8_t payloadLen = frameLen - 2;
-              if (type == CRSF_FRAMETYPE_RC_CHANNELS && payloadLen == CRSF_RC_PAYLOAD_LEN) {
+              if (type == CRSF_FRAMETYPE_RC_CHANNELS &&
+                  payloadLen == CRSF_RC_PAYLOAD_LEN) {
                 applyCrsfChannels(&frameBuf[1]);
               }
             }
@@ -369,10 +385,9 @@ void readCrsfPackets() {
 }
 
 // -----------------------------------------------------------------------------
-// SECTION E — Servo motion & CLI
+// Servo motion & CLI
 // -----------------------------------------------------------------------------
 void updateServos() {
-  // Slew limiter: move gradually toward targets to avoid gimbal overshoot.
   int panDiff  = targetPan  - currentPan;
   int tiltDiff = targetTilt - currentTilt;
 
@@ -392,105 +407,54 @@ void updateServos() {
   tiltServo.write(currentTilt);
 }
 
-// -----------------------------------------------------------------------------
-// Serial commands RX
-// -----------------------------------------------------------------------------
 void processSerialCommand(String command) {
   command.toLowerCase();
-
   if (command == "center") {
     targetPan  = PAN_CENTER;
     targetTilt = TILT_CENTER;
-    Serial.println("Moving to center position");
-
+    Serial.println("Center");
+  } else if (command == "mode" || command == "mode?") {
+    Serial.printf("Current mode: %s\n", modeName(inputMode));
   } else if (command.startsWith("mode")) {
-    if (command.endsWith("pwm") || command.endsWith("ppm")) {
-      setInputMode(MODE_PPM_LOCAL, true);
-    } else if (command.endsWith("crsf") || command.endsWith("elrs") || command.endsWith("uart")) {
-      setInputMode(MODE_CRSF_ELRS, true);
-    } else if (command.endsWith("espnow")) {
-      setInputMode(MODE_ESPNOW, true);
-    } else {
-      Serial.println("Unknown mode. Use 'mode ppm', 'mode crsf', or 'mode espnow'.");
-    }
-
+    if (command.endsWith("pwm"))  setInputMode(MODE_PPM_LOCAL, true);
+    else if (command.endsWith("auto")) setInputMode(MODE_RF_AUTO, true);
+    else Serial.println("Use 'mode pwm' or 'mode auto'");
   } else if (command == "debug") {
-    Serial.println("PPM Channel Values (last frame):");
-    for (int i = 0; i < 8; i++) {
-      Serial.printf("Channel %d: %lu µs\n", i + 1, ppmChannels[i]);
+    for (int i=0;i<8;i++) {
+      Serial.printf("CH%d: %luµs\n", i+1, ppmChannels[i]);
     }
-    Serial.printf("Current Position - Pan: %d, Tilt: %d\n", currentPan,  currentTilt);
-    Serial.printf("Target Position  - Pan: %d, Tilt: %d\n", targetPan,   targetTilt);
-
-  } else if (command == "limits") {
-    Serial.println("Servo Limits:");
-    Serial.printf("Pan: %d° to %d° (Center: %d°)\n", PAN_MIN, PAN_MAX, PAN_CENTER);
-    Serial.printf("Tilt: %d° to %d° (Center: %d°)\n", TILT_MIN, TILT_MAX, TILT_CENTER);
-
-  } else if (command.startsWith("deadband")) {
-    int space = command.indexOf(' ');
-    if (space > 0) {
-      int newDeadband = command.substring(space + 1).toInt();
-      if (newDeadband >= 0 && newDeadband <= 50) {
-        deadband = newDeadband;
-        Serial.printf("Deadband set to: %d\n", deadband);
-      } else {
-        Serial.println("Invalid deadband value (must be 0-50).");
-      }
-    }
-
-  } else if (command.startsWith("smooth")) {
-    int space = command.indexOf(' ');
-    if (space > 0) {
-      int newSmooth = command.substring(space + 1).toInt();
-      if (newSmooth >= 1 && newSmooth <= 50) {
-        smoothFactor = newSmooth;
-        Serial.printf("Smooth factor set to: %d\n", smoothFactor);
-      } else {
-        Serial.println("Invalid smooth factor value (must be 1-50).");
-      }
-    }
-
+    Serial.printf("Current %d %d Target %d %d Source %s\n",
+                  currentPan, currentTilt,
+                  targetPan, targetTilt,
+                  sourceName(activeSource));
   } else if (command == "test") {
-    Serial.println("Testing servo movement...");
     testServoMovement();
-
   } else {
-    Serial.println("Unknown command. Available: center, debug, limits, test,");
-    Serial.println("deadband X, smooth Y, mode ppm|crsf|espnow");
+    Serial.println("Unknown cmd");
   }
 }
 
 void testServoMovement() {
-  Serial.println("Testing pan movement...");
-  for (int pos = PAN_CENTER; pos <= PAN_MAX; pos += 5) {
-    panServo.write(pos);
-    delay(500);
+  for (int pos = PAN_CENTER; pos <= PAN_MAX; pos += 10) {
+    panServo.write(pos); delay(250);
   }
-  for (int pos = PAN_MAX; pos >= PAN_MIN; pos -= 5) {
-    panServo.write(pos);
-    delay(500);
+  for (int pos = PAN_MAX; pos >= PAN_MIN; pos -= 10) {
+    panServo.write(pos); delay(250);
   }
-  for (int pos = PAN_MIN; pos <= PAN_CENTER; pos += 5) {
-    panServo.write(pos);
-    delay(500);
+  for (int pos = PAN_MIN; pos <= PAN_CENTER; pos += 10) {
+    panServo.write(pos); delay(250);
   }
 
-  Serial.println("Testing tilt movement...");
-  for (int pos = TILT_CENTER; pos <= TILT_MAX; pos += 3) {
-    tiltServo.write(pos);
-    delay(500);
+  for (int pos = TILT_CENTER; pos <= TILT_MAX; pos += 6) {
+    tiltServo.write(pos); delay(250);
   }
-  for (int pos = TILT_MAX; pos >= TILT_MIN; pos -= 3) {
-    tiltServo.write(pos);
-    delay(50);
+  for (int pos = TILT_MAX; pos >= TILT_MIN; pos -= 6) {
+    tiltServo.write(pos); delay(250);
   }
-  for (int pos = TILT_MIN; pos <= TILT_CENTER; pos += 3) {
-    tiltServo.write(pos);
-    delay(500);
+  for (int pos = TILT_MIN; pos <= TILT_CENTER; pos += 6) {
+    tiltServo.write(pos); delay(250);
   }
 
-  Serial.println("Test complete - returning to center");
   currentPan  = PAN_CENTER;
   currentTilt = TILT_CENTER;
   targetPan   = PAN_CENTER;
@@ -500,23 +464,20 @@ void testServoMovement() {
 }
 
 // -----------------------------------------------------------------------------
-// Mode helpers
+// Mode helpers & CRSF parsing helpers
 // -----------------------------------------------------------------------------
 void setInputMode(InputMode newMode, bool announce) {
   inputMode = newMode;
-
   switch (inputMode) {
-    case MODE_ESPNOW:
+    case MODE_RF_AUTO:
       initEspNowRX();
-      break;
-    case MODE_CRSF_ELRS:
       initElrsUartRX();
+      activeSource = SOURCE_NONE;
       break;
     case MODE_PPM_LOCAL:
     default:
       break;
   }
-
   if (announce) {
     Serial.printf("Input mode set to %s\n", modeName(inputMode));
   }
@@ -525,31 +486,39 @@ void setInputMode(InputMode newMode, bool announce) {
 const char* modeName(InputMode m) {
   switch (m) {
     case MODE_PPM_LOCAL: return "PPM local";
-    case MODE_CRSF_ELRS: return "CRSF / ELRS";
-    case MODE_ESPNOW:    return "ESP-NOW";
+    case MODE_RF_AUTO:   return "RF auto (CRSF+ESP-NOW)";
     default:             return "Unknown";
+  }
+}
+
+const char* sourceName(ActiveSource s) {
+  switch (s) {
+    case SOURCE_NONE:   return "NONE";
+    case SOURCE_ESPNOW: return "ESP-NOW";
+    case SOURCE_CRSF:   return "CRSF";
+    default:            return "???";
   }
 }
 
 void applyCrsfChannels(const uint8_t* payload) {
   uint32_t bitBuffer = 0;
-  uint8_t bitsInBuffer = 0;
+  uint8_t  bitsInBuffer = 0;
   uint16_t channels[CRSF_RC_CHANNEL_COUNT] = {0};
-  uint8_t byteIndex = 0;
+  uint8_t  byteIndex = 0;
 
   for (int ch = 0; ch < CRSF_RC_CHANNEL_COUNT; ++ch) {
     while (bitsInBuffer < 11 && byteIndex < CRSF_RC_PAYLOAD_LEN) {
-      bitBuffer |= ((uint32_t)payload[byteIndex++]) << bitsInBuffer;
+      bitBuffer    |= ((uint32_t)payload[byteIndex++]) << bitsInBuffer;
       bitsInBuffer += 8;
     }
     channels[ch] = bitBuffer & 0x7FF;
-    bitBuffer >>= 11;
+    bitBuffer   >>= 11;
     bitsInBuffer -= 11;
   }
 
   int panMicro  = crsfToMicroseconds(channels[0]);
   int tiltMicro = crsfToMicroseconds(channels[1]);
-  int panDeg    = microsecondsToDegrees(panMicro, PAN_MIN, PAN_MAX);
+  int panDeg    = microsecondsToDegrees(panMicro,  PAN_MIN,  PAN_MAX);
   int tiltDeg   = microsecondsToDegrees(tiltMicro, TILT_MIN, TILT_MAX);
 
   linkPan  += (panDeg  - linkPan)  * LINK_SMOOTH_ALPHA;
@@ -558,7 +527,8 @@ void applyCrsfChannels(const uint8_t* payload) {
   targetPan  = constrain(static_cast<int>(linkPan  + 0.5f), PAN_MIN,  PAN_MAX);
   targetTilt = constrain(static_cast<int>(linkTilt + 0.5f), TILT_MIN, TILT_MAX);
 
-  lastValidFrame = millis();
+  lastCrsfTime   = millis();
+  lastValidFrame = lastCrsfTime;
 }
 
 uint8_t crsfCalcCRC(const uint8_t* data, uint8_t len) {
@@ -568,7 +538,7 @@ uint8_t crsfCalcCRC(const uint8_t* data, uint8_t len) {
     crc ^= *data++;
     for (uint8_t i = 0; i < 8; ++i) {
       if (crc & 0x80) crc = (crc << 1) ^ POLY;
-      else crc <<= 1;
+      else            crc <<= 1;
     }
   }
   return crc;
