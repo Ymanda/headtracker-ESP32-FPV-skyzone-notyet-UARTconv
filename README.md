@@ -3,6 +3,7 @@ Overview
 Transforms Skyzone head-tracking PPM into PAN/TILT commands sent through ELRS (CRSF) or ESP-NOW, then drives an AtomRC gimbal using a second ESP32.
 Diagram:
 Skyzone HT (PPM)
+```
 │
 ▼
 ┌───────────────┐        CRSF/ELRS         ┌───────────────┐
@@ -11,6 +12,7 @@ Skyzone HT (PPM)
 └───────────────┘        ESP-NOW fallback  └───────────────┘
 │                                                  │
 └── PWM bench (optional)                           └── Servos PAN/TILT
+```
 
 Pin Mapping
 ==============
