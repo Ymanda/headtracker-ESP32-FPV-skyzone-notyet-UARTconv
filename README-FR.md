@@ -4,13 +4,14 @@ Vue d’ensemble
 Transforme le PPM head-tracker Skyzone en commandes PAN/TILT envoyées via ELRS (CRSF) ou ESP-NOW, puis pilote un gimbal AtomRC avec un second ESP32.
 Diagramme :
 Skyzone HT (PPM)
-
-┌───────────────┐ - - - - CRSF/ELRS - - - ┌───────────────┐-
-│ - ESP32 TX - -│ - - - ------------->- - | - - ESP32 -RX │-
-│(côté lunettes)│ - - - - - - - - - - - - │ (côté gimbal) │-
-└───────────────┘ - - - ESP-NOW secours - └───────────────┘-
-│ - - - - - - - - - - - - - - - - - - - - - - - - -│-
-└── PWM bench (optionnel) - - - - - - - - -- - - - └── Servos PAN/TILT
+```
+┌───────────────┐      CRSF / ELRS      ┌───────────────┐
+│   ESP32 TX    │  -------------------> │   ESP32 RX    │
+│ (côté lunettes)│                      │ (côté gimbal) │
+└───────────────┘      ESP-NOW secours  └───────────────┘
+│                                    │
+└── PWM bench (optionnel)            └── Servos PAN/TILT
+```
 
 Affectation des broches
 =======================
